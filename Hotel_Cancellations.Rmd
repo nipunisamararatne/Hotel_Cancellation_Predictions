@@ -1,0 +1,940 @@
+---
+title: "Predicting Hotel Booking Cancellations in Portugal"
+author: Nipuni Samararatne
+output:
+  html_document:
+    df_print: paged
+---
+
+# {.tabset}
+
+```{r loadpackages, warning=FALSE, message=FALSE,echo=FALSE}
+pacman::p_load(caret, data.table, MASS, ggplot2,dplyr,gains,ISLR,leaps,RColorBrewer,
+rpart,rpart.plot,gbm,tree,moments,randomForest,varhandle,viridis,countrycode,pivottabler,Hmisc,brglm,arm,logistf,mlr,xgboost,car,tidyverse,formattable,DT,htmltools,ROSE)
+options(digits = 3)
+knitr::opts_chunk$set(echo = TRUE, fig.width=12, fig.height=6, fig.path = 'Figs/')
+theme_set(theme_classic())
+```
+
+## Background
+
+### Introduction
+
+Hotels find it difficult to correctly predict demand because of booking cancellations and they attempt to solve this problem through various means like tough cancellation policies (Antonio et al., 2019a). This, however, backfires because it leads to less demand (Antonio et al., 2019a). To counter this, it is important to be able to accurately determine which bookings are most likely to be canceled and pinpoint which factors are most influencing cancellations. Antonio et al. (2019a) discovered that using machine learning algorithms is an effective way to forecast cancellations. The study found that the number of booking changes, lead time, and market segment among others are influential predictors (Antonio et al., 2019a). Another study observed that some of the most important variables were online and early bookings, lead time, and country (Falk & Vieru, 2018). Finally, a study by Morales and Wang (2009) showed that depending on when you observe cancellations in the booking period, the influential variables seem to change as well. 
+
+### Data Description
+
+This dataset was on the website Kaggle but originally comes from an article called Hotel booking demand datasets (2019) by Nuno Antonio, Ana de Almeida, and Luis Nunes. Incidentally, they are the same researches of the first study discussed above but this dataset is different from the one used in that study. The dataset consists of data from a resort hotel and a city hotel. The resort hotel is in the region of Algarve in Portugal and the city hotel is in Lisbon, Portugal. The data contains bookings between July 1st, 2015 and August 31st, 2017. The bookings are of guests that were supposed to arrive during this time period and includes those who actually arrived and those who canceled the booking. There are 32 variables in total. Please see the supplemental variable description to understand what the variables mean.
+
+### Data Preprocessing
+
+The children column was the only one with missing values and it had 4 missing values. These were initially dropped. However, this eliminated some of the categories in the categorical variables. Therefore, they were changed to 0 so that a more accurate analysis could be done. Also, a new column called total nights was created as the sum of weekend nights and weeknights.
+
+Average daily rate (ADR) is calculated per booking by dividing the sum of all hotel transactions by the number of total nights. It is not clear from the researchers what they mean by hotel transactions but since there is an ADR reported for canceled bookings as well, it will be assumed to include either the upfront fee of a booking as well as transactions made while at the hotel. For canceled bookings this means the upfront fee divided by the total nights intended to stay and for noncancelled bookings this includes all fees to the hotel divided by the total nights a guest stayed. When checking the distribution of ADR, there were a lot of 0 values as well as one negative value which initially seemed to be errors. However, zero values actually represent those people who did not stay any nights and the one negative value must be for someone who owes a debt to the hotel. These values were not eliminated from the analysis since they would cancel each other out anyway when computing the average of the ADR for a country, for example, and in any case represents valuable information.
+
+
+```{r,results='hide',echo=FALSE}
+
+#read data
+hotel_bookings <- read.csv("hotel_bookings.csv")
+
+#check for missing values
+sum(is.na.data.frame(hotel_bookings))
+colSums(sapply(hotel_bookings, is.na))
+
+#replace all missing vals in children col as 0 so we don't lose data in other cols
+n <- length(hotel_bookings$children)
+for (i in 1:n) {
+  if (is.na(hotel_bookings$children[i]))
+    hotel_bookings$children[i] = 0
+}
+
+#add weekend nights & week nights columns to create total nights col
+hotel_bookings$total_nights <- hotel_bookings$stays_in_weekend_nights + hotel_bookings$stays_in_week_nights
+
+#find sum of transactions for each booking by multiplying adr by
+#total nights
+hotel_bookings$sum_transactions <- hotel_bookings$adr * hotel_bookings$total_nights
+
+#note there are some values labeled as null in different columns but that is on purpose and it means Not Applicable
+
+#undo factorization of some vars
+hotel_bookings$arrival_date_month <- unfactor(hotel_bookings$arrival_date_month)
+hotel_bookings$country <- unfactor(hotel_bookings$country)
+hotel_bookings$agent <- unfactor(hotel_bookings$agent)
+hotel_bookings$company <- unfactor(hotel_bookings$company)
+hotel_bookings$reservation_status_date <- unfactor(hotel_bookings$reservation_status_date)
+
+#convert arrival_date_month to a factor with month level names
+hotel_bookings$arrival_date_month = factor(hotel_bookings$arrival_date_month, levels = month.name)
+
+#data frame for non-cancelled bookings
+actualGuests <- filter(hotel_bookings, is_canceled == 0)
+
+#data frame for canceled bookings
+cancelled_bookings <- filter(hotel_bookings, is_canceled == 1)
+
+#break up dataset into 2(resort & city)
+resortData <- filter(hotel_bookings,hotel == "Resort Hotel")
+cityData <- filter(hotel_bookings,hotel == "City Hotel")
+
+#check distribution of adr for EDA & models
+# table(actualGuests$adr,actualGuests$hotel)
+# table(hotel_bookings$adr,hotel_bookings$is_canceled)
+```
+
+
+## Exploratory Data Analysis
+
+Note: actual guests = noncancelled bookings. Almost all of the analysis was focused on this segment to get accurate information about those actually staying at the hotels.
+
+### How many city bookings vs. resort bookings are there (broken down by canceled vs. noncancelled?
+
+There are 79,330 city hotel bookings and 40,060 resort hotel bookings. There is also a total of 44,224 canceled bookings and 75,166 noncancelled bookings. The canceled and noncancelled bookings of each hotel are displayed in the chart below along with this information. From this, we can see that the dataset is imbalanced because the class of interest, canceled bookings, amount to only 37% of all the data. There are also more city hotel bookings than resort hotel ones.
+
+```{r,echo=FALSE}
+
+#create new col to differentiate canceled vs. noncancelled
+hotel_bookings$cancel_status <- ifelse(hotel_bookings$is_canceled==0,"Noncancelled","Canceled")
+
+#create pivot table
+bookingsInfo <- PivotTable$new()
+bookingsInfo$addData(hotel_bookings)
+bookingsInfo$addColumnDataGroups("cancel_status")
+bookingsInfo$addRowDataGroups("hotel")
+bookingsInfo$defineCalculation(calculationName="Total Customers", summariseExpression="n()")
+bookingsInfo$renderPivot()
+
+```
+
+
+***
+
+### What countries are actual guests coming from?
+
+Looking at both hotels together, most customers come from Portugal which make sense given that both hotels are in Portugal. Out of the top 10 countries for customer origin, 9 are in Europe with the United States rounding out the list. 
+
+There were some values labeled as null in the country column. These were not deleted so as to preserve valuable information in other columns. 
+
+
+```{r,echo=FALSE}
+
+#convert country codes to country names
+actualGuests$country <- countrycode(actualGuests$country, 
+origin = "iso3c",destination ="country.name",
+custom_match = c("NULL" =  "NULL","CN" = "China","TMP"= "East Timor"))
+
+#create data frame w/ total guests per country
+custOrigin_tbl <- actualGuests %>%
+  group_by(country) %>%
+  dplyr::summarise(guests=n()) %>%
+  arrange(desc(guests))
+
+#change col names of data frame
+colnames(custOrigin_tbl) = c("Country", "Total Guests")
+
+#create interactive data table
+DT::datatable(custOrigin_tbl,caption = htmltools::tags$caption(style = 'caption-side: top; text-align: center; color:black; font-size:150% ;','Total Actual Guests vs. Country '))
+  
+```
+
+
+***
+
+### What are the different types of actual customers that stay at the two hotels?
+
+#### Booking Types:
+* Contract – booking has allotment or another contract
+* Group – associated with a group
+* Transient – not part of group or contract & not associated to other transient booking
+* Transient-party – booking is transient but associated with at least 1 other transient booking
+
+In terms of actual guests, both hotels have more transient and transient-party customers than any other. Transient customers are those that do not book in advance, do not stay for a long time, or simply come in and book (Landman, 2020b). The next most popular customer type is contract and there are more contract customers at the resort hotel than the city hotel. Group customers make up the smallest proportion of the total actual guests for both hotels.
+
+
+```{r,echo=FALSE}
+
+#create plot
+cust_types.gg <- ggplot(data = actualGuests,aes(x = actualGuests$customer_type,
+      fill = actualGuests$hotel))+geom_bar(position = "dodge")                          
+cust_types.gg + labs(fill = "Hotel Type",x="Customer Type",y="Count",title = "Distribution of Customer Types") + theme(plot.title = element_text(vjust=3)) + geom_text(stat='count', aes(label=..count..),position=position_dodge(width=0.9), vjust=-0.24)
+
+```
+
+
+***
+
+### Which hotel has a higher average ADR for actual guests?
+
+The following analysis was conducted on only noncancelled bookings since if a booking was canceled within the refund period, that revenue does not come to the hotel and it is important to know how much the hotel is really earning. Also, there is no way of knowing whether or not the customers received a refund or not from the dataset. 
+The boxplot shows that city hotel noncancelled bookings have a higher mean ADR than resort hotel noncancelled bookings. This means that the city hotel earns more from its actual customers than the resort hotel. Both types of bookings have a lot of outliers above the maximum average ADR with city hotel bookings also having outliers below the minimum average ADR.
+
+```{r,results='hide',echo=FALSE}
+
+#first check range of actual guests adr to use appropriate #'s in boxplot
+range(actualGuests$adr)
+
+#create boxplot
+boxplot(actualGuests$adr ~ actualGuests$hotel,col=heat.colors(3),ylim = c(-10,510), main = "ADR by Hotel Type", xlab = "Hotel Type",ylab = "Average Daily Rate")
+
+```
+
+
+***
+
+### Average actual hotel guests per month 
+
+The dataset contains bookings between July 1st, 2015 and August 31st, 2017. Simply looking at the total number of guests per month would present the wrong conclusions because there is not enough data for each month for this time period. Therefore, the data were averaged for each month so that more accurate conclusions could be drawn. Specifically, July and August data appear for 3 years so data for those 2 months was averaged over 3 years and the data for the rest of the months was averaged over 2 years. The chart shows that the beginning and end of summer including the fall are the busiest for both hotels.
+
+```{r,echo=FALSE}
+
+#Num of total & avg hotel guests per month per hotel
+monthlyGuests <- actualGuests %>%
+  group_by(arrival_date_month,hotel) %>%
+  dplyr::summarise(totalGuests = n())
+
+#average each month appropriately
+monthlyGuests <- monthlyGuests %>% mutate(avgGuests = ifelse(arrival_date_month == 'July' | arrival_date_month == 'August',totalGuests/3,totalGuests/2))
+
+#create plot
+  ggplot(monthlyGuests, aes(x=arrival_date_month,group=hotel,y=avgGuests, color=hotel)) +
+    geom_line(stat = "identity") +
+    scale_color_viridis(discrete = TRUE) +
+    labs(title = "Avg Actual Guests Per Month", x="Month", y="Avg # of Guests",colour = "Hotel Type") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+```
+
+
+***
+
+### Average cancellations per month 
+
+Again, given the time period of the data, the cancellations for each month were averaged using the same method for the different months as mentioned above. The chart shows that cancellations for the city hotel seem to follow its bookings trend. There is a big dip around June and July but the beginning and end of summer including the fall have the most cancellations. The resort hotel line appears more stable except for a big dip around November just like in the chart for monthly bookings.
+
+```{r,echo=FALSE}
+
+#Num of total cancellations per month per hotel
+monthlyCancels <- cancelled_bookings %>%
+  group_by(arrival_date_month,hotel) %>%
+  dplyr::summarise(totalCancels = n())
+
+#Average cancellations for each month appropriately
+monthlyCancels <- monthlyCancels %>% mutate(avgCancels = ifelse(arrival_date_month == 'July' | arrival_date_month == 'August',totalCancels/3,totalCancels/2))
+
+#create plot
+ggplot(monthlyCancels, aes(x=arrival_date_month,group=hotel,y=avgCancels, color=hotel)) +
+    geom_line(stat = "identity") +
+    labs(title = "Avg Cancellations Per Month", x="Month",y="Avg # of Cancellations",colour = "Hotel Type") +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+***
+
+### How many nights do actual guests spend at the 2 hotels?
+
+In both hotels, most actual guests stay from between 0 and about 20 nights. This makes sense from the earlier observation that both hotels have more transient customers than any other so people are not prone to staying for an especially long time. 
+
+```{r,echo=FALSE}
+
+#create plot
+ggplot(data=actualGuests, aes(x=actualGuests$total_nights, fill=actualGuests$hotel)) +
+    geom_histogram(color="#e9ecef", alpha=0.6, position = 'identity',binwidth = 3) +
+    scale_fill_manual(values=c("#69b3a2", "#404080"))+ theme(plot.title = element_text(size=15)) + labs(title="Length of Stay",colour = "Hotel Type",x="Total Nights", y="Count",fill="Hotel Type")
+
+```
+
+
+***
+### What is the distribution of meal categories chosen by actual guests?
+
+#### Category Designation:
+* BB- Bed & Breakfast
+* HB- Half Board (breakfast & 1 other meal)
+* FB- Full Board (breakfast, lunch, & dinner)
+* Undefined/SC- no meal package
+
+The most frequently chosen meal category for both hotels is BB. This might be because customers want to spend as less as possible on food at the hotel assuming that they can get a cheaper meal elsewhere. It also might be because most guests are from the same country and therefore, they might be familiar with cheaper restaurants in the area. Another possible reason for this could be that guests prefer to sample the local cuisine than just eat from the hotel. Please note however that all of these are simply inferences and are not substantiated by research.
+
+
+```{r fig.width=14,echo=FALSE}
+
+#create plot
+meal <- ggplot(data = actualGuests,aes(x = actualGuests$meal,
+      fill = actualGuests$hotel))+geom_bar(position = "dodge")                          
+meal + labs(title = "Frequency of Meal Types",fill = "Hotel Type",x="Meal Type",y="Count") + geom_text(stat='count', aes(label=..count..),position=position_dodge(width=0.9), vjust=-0.25) + scale_fill_manual(values = c("#00AFBB", "#E7B800"))
+
+```
+
+
+***
+### Which market segments are most represented in the city hotel?
+
+TA- travel agents, TO-tour operators
+
+Market segment categories are similar to distribution channel categories, so the analysis was focused on market segments instead. Market segmentation basically means dividing the customer base into different kinds of markets where in each category there are groups with similar booking behaviors (Hotelbeds, 2020). It is not clear what groups means but research online suggests that this refers to weddings, events, and crew bookings, for example (Iyer, 2020). Direct refers to direct bookings made to the hotel via phone/email, for example (Iyer, 2020). Corporate bookings are those where guests stay for rates given by companies (Burns, 2020). Complimentary bookings as suggested by the internet are free bookings given by the hotel and aviation does not have a specific meaning, but it will be assumed to refer to airline crew (Landman, 2020a).
+
+The analysis was focused on both noncancelled and canceled bookings to determine exactly what kind of customers are placing bookings and where these bookings are coming from. The most populous market segments in the city hotel are online TA, offline TA/TO, and Groups. 
+
+```{r fig.width=13,echo=FALSE}
+
+#create plot
+marketCity <- ggplot(data = cityData,aes(x = cityData$market_segment))+geom_bar(position = "dodge",fill = "purple")  
+
+marketCity + labs(title = "City Hotel Market Segments",x="Market Segment",y="Count") + geom_text(stat='count', aes(label=..count..),position=position_dodge(width=0.9), hjust=-0.25) + coord_flip()  
+```
+
+
+***
+### Which market segments are most represented in the resort hotel?
+
+Again, the analysis was focused on both noncancelled and canceled bookings so that a clear picture of the origins of bookings can be drawn.
+
+For the resort hotel, again the biggest market segment is online TA followed by offline TA/TO. The third most popular category here is direct though which is interesting because it would make more sense for there to be more group bookings since it is a resort hotel and therefore there would be more weddings and events etc. However, it is important to note that this is merely an inference. 
+
+
+```{r fig.width=13,echo=FALSE}
+
+#create plot
+marketResort <- ggplot(data = resortData,aes(x = resortData$market_segment))+geom_bar(position = "dodge", fill = "steelblue")  
+
+marketResort + labs(title = "Resort Hotel Market Segments",x="Market Segment",y="Count") + geom_text(stat='count', aes(label=..count..),position=position_dodge(width=0.9), hjust=-0.25) + coord_flip()  
+```
+
+
+***
+
+### What is the average ADR for different actual customer types?
+
+To find the average ADR for a customer type, all of the transactions were summed for each customer type and divided by the total nights for each customer type.
+
+For both types of hotels, transient customers have the highest average ADR. This makes sense given that there are more transient customers at both hotels than any other customer type. For the city hotel, contract customers have the second highest average ADR while for the resort hotel, the second highest average ADR is for group customers.
+
+```{r,echo=FALSE}
+
+#create dataframe with grouped cust types/hotel & total transactions, total nights
+avgADR <- actualGuests %>% group_by(customer_type, hotel) %>% 
+      dplyr::summarise(sum_transac = sum(sum_transactions),sum_totalnights = sum(total_nights))
+
+#create new col of mean ADR
+avgADR <- avgADR %>%
+  mutate(meanADR = sum_transac/sum_totalnights)
+
+# making the plot
+ggplot(avgADR, aes(x = customer_type, y = meanADR, fill = hotel)) +
+    geom_bar(stat = "identity", position = "dodge") + labs(x="Customer Type",y="Mean Average Daily Rate",title="Mean ADR by Customer Type & Hotel Type",fill = "Hotel Type") + geom_text(aes(label=round(meanADR,digits=2)), position=position_dodge(width=0.9), vjust=-0.25) + ylim(0,120) +
+    scale_fill_brewer()
+```
+
+
+***
+
+### What is the average ADR for actual guests for the resort hotel per country? In particular what are the top 10 countries with highest average ADR?
+
+To find the average ADR per country, the same method employed in the previous question was used.
+
+There is a mix of different countries from different continents. Guests from Andorra had the highest average ADR while guests from Dijibouti had the second highest average ADR. None of the top 10 countries were in the top 10 list for total guests. So, even though there are not a lot of guests from these countries, the guests that do come spend more and/or paid a higher price upfront for the booking than guests from other countries and stayed for a shorter period of time. This actually does make sense when looking at the boxplot of ADR because there were a lot of outliers for both hotels.
+
+```{r,echo=FALSE}
+
+#create new dataframe with sum of transac & sum of total nights
+resortADR_tbl <- actualGuests %>% filter(hotel=="Resort Hotel") %>%
+   group_by(country) %>%
+  dplyr::summarise(sum_transac = sum(sum_transactions),sum_totalnights = sum(total_nights))
+
+#add new meanADR col
+resortADR_tbl <- resortADR_tbl %>%
+  mutate(meanADR = sum_transac/sum_totalnights)
+
+#remove sum of transac & sum of total nights & arrange in desc order
+resortADR_tbl <- resortADR_tbl %>% select (-c(sum_transac,sum_totalnights)) %>%
+  arrange(desc(meanADR)) 
+
+#round meanADR to 2 decimals
+resortADR_tbl[,'meanADR']=round(resortADR_tbl[,'meanADR'],2)
+
+#change col names
+colnames(resortADR_tbl) = c("Country", "Mean ADR")
+
+#create interactive data table
+DT::datatable(resortADR_tbl,caption = htmltools::tags$caption(style = 'caption-side: top; text-align: center; color:black; font-size:150% ;','Resort Hotel: Mean ADR vs. Country '))
+
+```
+
+***
+
+### What is the average ADR for actual guests for the city hotel per country? In particular what are the top 10 countries with the highest average ADR?
+
+Again, to find the average ADR per country, the same method employed in the previous questions was used.
+
+There is a mix of different countries in different continents and the highest mean ADR is for Anguilla while the second highest is for Comoros. The top 10 for the city hotel also has countries that were not in the top 10 for most guests. Again, this means that guests from these countries either spend a lot more than others and/or paid a higher price upfront and stayed for shorter time. Also, these are probably outliers as seen in the boxplot for ADR.
+
+
+```{r,echo=FALSE}
+
+#create new dataframe with sum of transac & sum of total nights
+cityADR_tbl <- actualGuests %>% filter(hotel=="City Hotel") %>%
+   group_by(country) %>%
+  dplyr::summarise(sum_transac = sum(sum_transactions),sum_totalnights = sum(total_nights))
+
+#add new meanADR col
+cityADR_tbl <- cityADR_tbl %>%
+  mutate(meanADR = sum_transac/sum_totalnights) 
+
+#remove sum of transac & sum of total nights & arrange in desc order
+cityADR_tbl <- cityADR_tbl %>% select (-c(sum_transac,sum_totalnights))  %>% arrange(desc(meanADR))
+
+#round meanADR to 2 decimals
+cityADR_tbl[,'meanADR']=round(cityADR_tbl[,'meanADR'],2)
+
+#change col names
+colnames(cityADR_tbl) = c("Country", "Mean ADR")
+
+#create interactive data table
+DT::datatable(cityADR_tbl,caption = htmltools::tags$caption(style = 'caption-side: top; text-align: center; color:black; font-size:150% ;','City Hotel: Mean ADR vs. Country '))
+
+```
+
+***
+
+### Where do repeat actual guests in the resort hotel come from? In particular, what are the top 10 countries for repeat actual guests?
+
+Most actual return guests in the resort hotel come from Portugal which makes sense because Portugal provides the most total guests as well. The top 10 countries also include most of the countries that were in the top 10 for total guests. 
+
+```{r,echo=FALSE}
+
+#create dataframe grouped by country & total of repeat guests
+resortRepeat_tbl <- actualGuests %>% filter(hotel=="Resort Hotel") %>%
+   group_by(country) %>%
+   dplyr::summarise(total_repeatguests = sum(is_repeated_guest==1)) %>%
+   arrange(desc(total_repeatguests)) 
+
+#change col names
+colnames(resortRepeat_tbl) = c("Country", "Total Return Guests")
+
+#create interactive datatable
+DT::datatable(resortRepeat_tbl,caption = htmltools::tags$caption(style = 'caption-side: top; text-align: center; color:black; font-size:150% ;','Resort Hotel: Total Return Guests vs. Country '))
+
+```
+
+
+***
+
+### Where do repeat actual guests in the city hotel come from? In particular, what are the top 10 countries for repeat actual guests?
+
+Most actual return guests in the city hotel also come from Portugal and the top 10 countries also include most of the countries that were in the top 10 for total guests. The top 10 countries also look similar to the top 10 of the resort hotel. 
+
+```{r,echo=FALSE}
+
+#create dataframe grouped by country & total of repeat guests
+cityRepeat_tbl <- actualGuests %>% filter(hotel=="City Hotel") %>%
+   group_by(country) %>%
+   dplyr::summarise(total_repeatGuests = sum(is_repeated_guest==1))     %>% arrange(desc(total_repeatGuests)) 
+
+#change col names
+colnames(cityRepeat_tbl) = c("Country", "Total Return Guests")
+
+#create interactive datatable
+DT::datatable(cityRepeat_tbl,caption = htmltools::tags$caption(style = 'caption-side: top; text-align: center; color:black; font-size:150% ;','City Hotel: Total Return Guests vs. Country '))
+```
+
+
+***
+
+### Are most repeated guests only adults or adults with children &/or babies (labeled as kids or no kids)?
+
+For this analysis, only actual guests who returned were considered and the total number of kids was considered to be the sum of children and babies. 
+
+Most of the actual guests that come back if we are looking at both hotels together are those that do not have kids. The presence of kids does not necessarily mean that it was a family but if we think as such, it makes intuitive sense since families with children would probably have more logistical challenges and therefore might not take as many trips in the first place. However, this is just an inference and research would need to be conducted to determine if this is true for other hotels as well. One other thing to note is that there are significantly more first-time guests than repeat guests.
+
+```{r,echo=FALSE}
+
+#create new cols for use in table 
+actualGuests$Kids <- actualGuests$children + actualGuests$babies
+actualGuests$Kids_Present <- ifelse(actualGuests$Kids==0,"No Kids","Kids")
+actualGuests$repeat_Status <- ifelse(actualGuests$is_repeated_guest==0,"New Guest","Repeat Guest")
+
+#create pivot table
+kidsInfo <- PivotTable$new()
+kidsInfo$addData(actualGuests)
+kidsInfo$addColumnDataGroups("repeat_Status")
+kidsInfo$addRowDataGroups("Kids_Present")
+kidsInfo$defineCalculation(calculationName="Total Repeat Customers", summariseExpression="n()")
+kidsInfo$renderPivot()
+
+```
+
+## Classification Models
+
+### Preprocessing
+
+The dependent variable considered was is_canceled because the goal is to predict cancellations. Of the predictor variables, arrival_date_year, arrival_date_month, arrival_date_week_number, arrival_date_day_of_month, country, distribution_channel, reserved_room_type, agent, company, required_car_parking_spaces, reservation_status, and reservation_status_date were eliminated from the analysis. Some of these variables like arrival date information, agent, company, and reservation status date were eliminated because they were deemed unimportant in predicting cancellations. Required number of car parking spaces was dropped because all of the canceled bookings had a value of 0 for this column and so models would predict according to this variable perfectly which renders the model useless. Reservation status was dropped because it is a variable with leakage since whether a booking was canceled or not is derived from this variable. Distribution channel was dropped because it is similar to market_segment. Country was dropped due to limitations in computing time because it was required to convert the column into a factor for some of the models and there are many levels in the column. Also, some of the countries were severely imbalanced with regards to the dependent variable, meaning that all bookings originating from one country were canceled, for example. Reserved room type was dropped because the assigned room type sometimes is different from it and so assigned room type is more final. Finally, new variables that were created during prior analysis were also dropped.
+
+After deleting these variables, pivot tables were constructed of the categorical predictor variables against the dependent variable to check class imbalance. In assigned_room_type levels L and P, and market_segment level Undefined, there were no observations for is_canceled equals 0. Therefore, these levels were dropped to prevent problems when running the models.
+
+Only a random sample of 30,000 was selected to run the models because of limitations in computer memory. Of these observations, 80% were randomly selected to train the models and 20% were randomly selected to test the models. Due to the dependent variable being unbalanced with 63% noncancelled bookings and 37% canceled bookings, oversampling was done. 
+
+
+```{r,results='hide',echo=FALSE}
+
+#check dist of some vars against dependent var
+table(hotel_bookings$required_car_parking_spaces,hotel_bookings$is_canceled)
+table(hotel_bookings$country,hotel_bookings$is_canceled)
+
+#create data frame w/ some columns dropped
+modelData.df <- hotel_bookings[,-c(4,5,6,7,14,16,20,24,25,29,31,32,33,34,35)]
+
+#check dist of factor vars against dependent var for imbalance
+table(modelData.df$hotel,modelData.df$is_canceled)
+table(modelData.df$meal,modelData.df$is_canceled)
+table(modelData.df$market_segment,modelData.df$is_canceled)
+table(modelData.df$deposit_type,modelData.df$is_canceled)
+table(modelData.df$customer_type,modelData.df$is_canceled)
+table(modelData.df$assigned_room_type,modelData.df$is_canceled)
+table(modelData.df$is_repeated_guest,modelData.df$is_canceled)
+
+#delete rows where categorical vars unbalanced
+modelData.df <- subset(modelData.df, assigned_room_type!="L")
+modelData.df <- subset(modelData.df, assigned_room_type!="P")
+modelData.df <- subset(modelData.df, market_segment!="Undefined")
+
+#drop unused factor levels
+modelData.df = droplevels(modelData.df)
+
+#create random sample of 30000 obs
+set.seed(42)
+sample.df <- sample_n(modelData.df,30000)
+
+#create data partition with 80% training/20% validation
+set.seed(42)
+train.index <- createDataPartition(sample.df$is_canceled, p = 0.8, list = FALSE)
+train.df <- sample.df[train.index, ]
+valid.df <- sample.df[-train.index, ]
+
+#check dist of train's dependent var for use in oversampling
+table(train.df$is_canceled)
+
+#do oversampling b/c dependent variable unbalanced
+roseSampling <- ovun.sample(is_canceled~.,data=train.df,method="over", N = 29930)$data
+
+```
+
+
+***
+
+### Logistic Regression
+
+Results show a warning that fitted probabilities 0 or 1 occurred and this is because there is either quasi or complete separation in the dataset for some observations. Deleting the levels of factors that had an imbalance as stated previously was done in an attempt to remove this warning from appearing. The hope was that oversampling might also eliminate the warning, but the warning continued to persist. However, this does not detract from the implications of the results and as can be seen later on, it was not a problem when generating the predicted probabilities of belonging to class 0 or 1 for the dependent variable. Therefore, this warning is not that much of a significant issue in the model. 
+
+The call results show the estimates, which are estimated betas for each variable or level of a variable and will be used to generate the log odds for each variable. The AIC value is an indicator of how good the model is, and a lower AIC value is always desired. However, if we want to know if this is a good AIC value or not, we would have to compare it with the values of other models. As such, the models that follow after this were not evaluated using the AIC value. We will evaluate this model with the other models in terms of accuracy, sensitivity, and specificity. 
+
+The p-values are lowest for lead_time, stays_in_week_nights, children, previous_cancellations, previous_bookings_not_cancelled, assigned room type D, F, and G, booking_changes, deposit_typeNon Refund, customer_typeTransient, adr, and total_of_ special_requests. This means that they are the most significant variables in predicting whether a hotel booking is going to be canceled or not in this dataset. The dataset does not specify exactly what kind of rooms types D, F, and G are but other than that, all of these make intuitive sense. For example, guests that booked a long time ago, those with children, or those with a lot of previous cancellations would seem more likely to cancel a booking. The one predictor that is surprising is the non-refundable deposit type because one would think that particular deposit type would be more of a factor in not canceling a booking. 
+
+```{r,echo=FALSE}
+#Logistic Regression
+set.seed(42)
+logitModel <- glm(is_canceled ~., data = roseSampling, family = "binomial")
+
+options(scipen=999)
+summary(logitModel)
+
+```
+
+
+
+Odds Ratios:
+
+We would interpret the odds ratio in the following way. For example, if we are looking at deposit_typeRefundable since the number is less than 1, we would subtract its odds ratio of 0.6626 from 1 and multiply by 100 to get 33.74%. We would interpret this by saying that bookings that belong to the refundable deposit type are 33.74% less likely to be canceled than bookings belonging to other deposit types. On the flip side, for stays_in_weekend_nights since the odds ratio is greater than 1, we would subtract 1 from its odds ratio of 1.0333 and multiply by 100 to get 3.33%. We would interpret this by saying that the odds ratio of a booking being canceled goes up by 3.33% if stays_in_weekend_nights goes up by one unit.
+
+```{r,echo=FALSE}
+
+# Generate odds-ratios
+exp(coef(logitModel))
+
+```
+
+
+
+Confusion Matrix for Training Set:
+
+The confusion matrix for the training set was found to compare the accuracy with the validation set’s accuracy to test for overfitting/underfitting or any other problems. The analysis will follow with the confusion matrix for the validation set.
+
+```{r,echo=FALSE}
+
+#Predict
+logitProbsTrain <- predict(logitModel, roseSampling, type = "response")
+
+#generate probabilities
+logitPredsTrain <- ifelse(logitProbsTrain > 0.5,1,0)
+
+#generate confusion matrix
+confusionMatrix(as.factor(logitPredsTrain),as.factor(roseSampling$is_canceled),positive = '1')
+
+```
+
+
+
+
+Performance Evaluation for Validation Set:
+
+These are the predicted probabilities for the validation set using the logistic regression model. If we are using a cut off value of 0.5 to say that observations with predicted probabilities above the cut off value are those that will be canceled, we can say for example that observations 18, 21, and 38 are those bookings that are going to be canceled.
+
+```{r,echo=FALSE}
+
+#Predict
+logitProbsValid <- predict(logitModel, valid.df, type = "response")
+
+t(t(head(logitProbsValid, 10)))
+
+```
+
+
+
+Confusion Matrix for Validation Set:
+
+If we use the cut off value of 0.5, we can generate a confusion matrix which shows us the accuracy of the model as well as the sensitivities and specificities. As can be seen below, the accuracy is 0.778 or 77.8% and looking at the class of interest (1), we can see that the sensitivity is 0.7 or 70% and the specificity is 0.823 or 82.3%. 
+
+Accuracy is the total of all correctly predicted canceled and noncancelled bookings out of all the bookings. An accuracy of 0.778 is fairly good. Sensitivity here is an indicator of how many bookings were correctly identified as canceled out of all the actual canceled bookings. Specificity measures how many correctly predicted noncancelled bookings there are out of all actual noncancelled bookings. Here we can see that the model is doing a better job of ruling out the negative class (0), that is specificity, than it is at identifying the class of interest, that is sensitivity. Both numbers should be fairly high, and they are so that is good. 
+
+There is also another metric called precision which determines the correct predictions out of all bookings predicted to be canceled. We would rather focus on sensitivity to evaluate this model as well as the ones that follow than precision because it is more important to reduce the number of false negatives than it is to be confident of true positives. This means that we would rather have a few false alarms with some bookings that were not canceled being labeled as canceled than to mistakenly say a booking was not canceled when it was actually canceled. 
+
+Another thing to note is that the p-value is almost 0 which means that the model is performing better than if we had used no model at all which is represented by the no information rate (NIR).
+
+Finally, the accuracy of the training set is a little lower than the validation set which is unusual because we would expect to see the opposite. This might be because of oversampling or because there is not enough data in the validation set.
+
+```{r,echo=FALSE}
+
+#generate probabilities
+logitPredsValid <- ifelse(logitProbsValid > 0.5,1,0)
+
+#generate confusion matrix
+confusionMatrix(as.factor(logitPredsValid),as.factor(valid.df$is_canceled),positive = '1')
+
+```
+
+
+***
+
+### Classification Tree
+
+The classification tree below shows that the first split is on deposit type (no deposit or refundable), then the next split is on whether lead time is < 12, third is on different categories of market segments and so on. At each stage it is choosing the split that will reduce the impurity the most. An example of how to interpret the tree is by saying, for example, that when deposit type is no deposit or refundable, lead time is less than 12, market segment is one of the categories listed below, and when previous cancellations is greater than or equal to 0.5, the class is 1 or canceled. 
+
+In the rules, the left most column indicates the percentage of observations that are canceled in each terminal node when deposit type is no deposit or refundable and lead time is less than 12 etc. The column on the far right is that of cover which represents the percentage of observations in different terminal nodes. 
+
+```{r,echo=FALSE}
+
+#Classification Tree
+set.seed(42)
+classTree <- rpart(is_canceled ~ ., data = roseSampling, method = "class")
+prp(classTree, type = 1, extra = 1, under = TRUE, roundint = FALSE, 
+    split.font = 2, varlen = -10, box.palette = "BuOr")
+rpart.rules(classTree, cover = TRUE)
+
+```
+
+
+Confusion Matrix for Training Set:
+
+Again, the confusion matrix for the training set shows the accuracy which will be compared to the validation set to determine if there is overfitting/underfitting or any other problems.
+
+```{r,echo=FALSE}
+
+# for Training set
+classTree.trainPreds <- predict(classTree, 
+                                data = roseSampling, 
+                                type = "class")
+confusionMatrix(classTree.trainPreds, as.factor(roseSampling$is_canceled),positive = '1')
+
+```
+
+
+
+Confusion Matrix for Validation Set:
+
+The accuracy for the validation set has gone up from the logistic regression model to 0.804 or 80.4% and again the p-value is almost 0 which is good. The sensitivity has gone down to 0.604 or 60.4% but the specificity has gone up to 0.919 or 91.9%. While the model is doing a good job of predicting true positives and true negatives and of ruling out the negative class, again what we are most interested is in sensitivity. In that sense this model is not that great.
+
+Compared to the training set, again we see that the validation set has a higher accuracy which is unusual. It might be due to oversampling or because there is not enough data in the validation set. 
+
+```{r,echo=FALSE}
+# for Validation set
+classTree.validPreds <- predict(classTree, 
+                                newdata = valid.df, 
+                                type = "class")
+confusionMatrix(classTree.validPreds, as.factor(valid.df$is_canceled), positive = '1')
+
+```
+
+
+
+***
+
+### Gradient Boosting
+
+In boosting, trees are grown sequentially, and a tree is fit to the residuals not the target. It has 3 hyperparameters, number of trees, shrinkage parameter, and number of splits in each tree. For this project, I chose number of trees to be 1000, the shrinkage parameter as 0.2, and the number of splits as 4. The relative influence results show that the three most influential variables in predicting cancellations are deposit type, lead time, and adr. 
+
+```{r,echo=FALSE}
+
+#Gradient Boosting
+set.seed(42)
+
+boost.hotel <- gbm(is_canceled~.,data = roseSampling, distribution = "bernoulli", n.trees = 1000, interaction.depth = 4, shrinkage = 0.2, verbose = F)
+
+summary(boost.hotel)
+
+```
+
+
+
+Confusion Matrix for Training Set:
+
+The accuracy comparison for the training set versus validation set will follow below. 
+
+```{r,echo=FALSE}
+
+#Predictions for training
+boostProbsTrain <- predict(boost.hotel, roseSampling, n.trees = 1000, type = "response")
+
+boostPredsTrain <- ifelse(boostProbsTrain> 0.5,1,0)
+
+confusionMatrix(as.factor(boostPredsTrain),as.factor(roseSampling$is_canceled),positive = '1')
+
+```
+
+
+
+Confusion Matrix for Validation Set:
+
+Using a cut off value of 0.5 for the probabilities, the validation set has an accuracy of 0.815 or 81.5% which is higher than both the accuracy of the classification tree’s validation set and logistic regression’s validation set so that is good. The sensitivity is also higher than both at 0.752 at 75.2%. The specificity is lower than the classification tree at 0.851 or 85.1% but higher than the logistic regression model. Again, we have the case that specificity is higher than sensitivity but since there is not a huge difference between the numbers and both numbers are relatively high, it is not that worrisome. The model also has higher accuracy than the NIR and the p-value is low which is a good sign.
+
+For this model, the training set has a higher accuracy than the validation set which is what we usually detect. There does not seem to be a problem with overfitting because there is not that much of a difference between the numbers. Overfitting refers to when the model performs much better on the training set than on new data because it is fitting the data too perfectly. 
+
+```{r,echo=FALSE}
+
+#Predictions for validation
+boostProbsValid <- predict(boost.hotel, valid.df, n.trees = 1000, type = "response")
+
+boostPredsValid <- ifelse(boostProbsValid > 0.5,1,0)
+
+confusionMatrix(as.factor(boostPredsValid),as.factor(valid.df$is_canceled),positive = '1')
+
+```
+
+
+
+***
+
+### Random Forest
+
+Random Forest uses a bootstrapped process to create trees and at each split only a random number of predictors are picked to split on. The number of predictors is usually taken to be the square root of the total predictors. In this case that would be 4 since there are 19 predictors. However, after experimenting with different mtry values, 8 provided the highest accuracy so the number of split candidates was selected to be 8. In addition, the number of trees were automatically selected by the environment to be 500. The OOB estimate of error rate is low at 8.33% and the error rate for the class of interest (1) is also low at 0.05 which is good.
+
+```{r,echo=FALSE}
+
+#Random Forest
+roseSampling$is_canceled <- as.factor(roseSampling$is_canceled)
+valid.df$is_canceled <- as.factor(valid.df$is_canceled)
+
+set.seed(42)
+
+rf.hotel <- randomForest(is_canceled~., data = roseSampling, mtry = 8, importance = TRUE)
+rf.hotel
+
+```
+
+
+
+Confusion Matrix for Training Set:
+
+The accuracy comparison for the training set versus validation set will follow below.
+
+```{r,echo=FALSE}
+
+#Predictions for Training
+randforest.predstrain <- predict(rf.hotel, roseSampling, type = "response")
+confusionMatrix(randforest.predstrain, roseSampling$is_canceled, positive = '1')
+
+```
+
+
+
+Confusion Matrix for Validation Set:
+
+Predictions from the validation set show that the accuracy has improved to 0.838 or 83.8% from the previous models and it is again higher than the NIR and there is a low p-value. The sensitivity is higher at 0.736 or 73.6% than logistic regression and the classification tree but lower than gradient boosting. The specificity at 0.896 or 89.6% is higher than logistic regression and gradient boosting but lower than the classification tree. We continue to see the trend where specificity is higher than sensitivity but for the reasons mentioned previously, this is not that much of an issue.
+
+Like the boosting model, we see that the training set has a higher accuracy than the validation set but there might be some overfitting in this model because the difference is higher between the training and validation and the confidence intervals are not the same.
+
+```{r,echo=FALSE}
+
+#Predictions for validation
+randforest.predsvalid <- predict(rf.hotel, valid.df, type = "response")
+confusionMatrix(randforest.predsvalid, valid.df$is_canceled, positive = '1')
+
+```
+
+
+
+Variable Importance:
+
+The mean decrease in accuracy chart shows that lead_time, adr, and market_segment are the top 3 most important variables in the sense that removing them would lead to the biggest decrease in accuracy. 
+
+The mean decrease in Gini chart shows that the top 3 variables of lead_time, adr, and deposit_type would cause the most decrease in impurity meaning they are the most important if considering the gini metric.
+
+```{r,echo=FALSE}
+#Variable importance
+impToPlot <- importance(rf.hotel)
+impToPlot
+dotchart(sort(impToPlot[,3]), xlim=c(0,350), xlab="MeanDecreaseAccuracy")
+dotchart(sort(impToPlot[,4]), xlim=c(0,3000), xlab="MeanDecreaseGini")
+
+```
+
+***
+
+### XGBoost 
+
+XGBoost is an algorithm like gradient boosting but better and faster. It is also supposed to be more powerful than a random forest model. 
+
+First, the training and validation sets were converted into data tables. Then, to use this model, all the categorical variables and dependent variable need to be converted to numerical variables using one hot encoding so that was the second step. Next, the data table was converted to a matrix. In terms of building the model, all of the parameters that were used were the default like eta equals 0.3 and gamma equals 0. Fivefold cross validation was done to find the best iteration with the lowest error. Finally, to generate predictions, a cut off value of 0.5 was used for the probabilities. 
+
+
+```{r,results='hide',echo=FALSE}
+
+set.seed(42)
+
+#xgboost model
+
+#one hot encoding
+setDT(roseSampling)
+setDT(valid.df)
+
+rose.depVar <- roseSampling$is_canceled 
+valid.depVar <- valid.df$is_canceled
+matrix.train <- model.matrix(~.+0,data = roseSampling[,-c("is_canceled"),with=F]) 
+matrix.valid <- model.matrix(~.+0,data = valid.df[,-c("is_canceled")],with=F)
+
+#convert factor to numeric 
+rose.depVar <- as.numeric(rose.depVar)-1
+valid.depVar <- as.numeric(valid.depVar)-1
+
+#preparing matrix 
+dmatrix.train <- xgb.DMatrix(data = matrix.train,label = rose.depVar) 
+dmatrix.valid <- xgb.DMatrix(data = matrix.valid,label = valid.depVar) 
+
+#default parameters
+paramsVals <- list(booster = "gbtree", objective = "binary:logistic", eta=0.3, gamma=0, max_depth=6, min_child_weight=1, subsample=1, colsample_bytree=1)
+
+xgb.crossValid <- xgb.cv(params = paramsVals, data = dmatrix.train, nrounds = 100, nfold = 5, showsd = T, stratified = T, print_every_n = 10, early_stopping_rounds = 20, maximize = F)
+
+xgbmodel <- xgb.train (params = paramsVals, data = dmatrix.train, nrounds = xgb.crossValid$best_iteration , watchlist = list(val=dmatrix.valid,train=dmatrix.train), print_every_n = 10, early_stopping_rounds = 10, maximize = F , eval_metric = "error")
+
+#model prediction for training
+xgb.predstrain <- predict (xgbmodel,dmatrix.train)
+xgb.predstrain <- ifelse (xgb.predstrain > 0.5,1,0)
+
+#model prediction for validation
+xgb.predsvalid <- predict (xgbmodel,dmatrix.valid)
+xgb.predsvalid <- ifelse (xgb.predsvalid > 0.5,1,0)
+
+```
+
+
+Confusion Matrix for Training Set:
+
+The accuracy comparison for the training set and the validation set will be discussed below. 
+
+```{r,echo=FALSE}
+#confusion matrix for training
+confusionMatrix (as.factor(xgb.predstrain), as.factor(rose.depVar),positive = '1')
+
+```
+
+
+
+Confusion Matrix for Validation Set:
+
+The accuracy of the validation set is 0.818 or 81.8% and is higher than the logistic regression, classification tree, and gradient boosting models but lower than the random forest model. The sensitivity is at 0.749 or 74.9% and is higher than the logistic regression, classification tree, and random forest models but lower than the gradient boosting model. Specificity is at 0.858 or 85.8% and is lower than the classification tree and random forest models but higher than the logistic regression and gradient boosting models. Also, the model is performing better than if there was no model represented by the NIR because the p-value is almost 0. Finally, we see that specificity is higher than sensitivity like in all the other models but again this is not that much of a problem.
+
+Like the boosting and random forest models, we see that the training set has a higher accuracy than the validation set which is generally expected. There does not seem to be overfitting because the numbers are not that far apart. 
+
+```{r,echo=FALSE}
+#confusion matrix for validation
+confusionMatrix (as.factor(xgb.predsvalid), as.factor(valid.depVar),positive = '1')
+
+```
+
+
+Variable Importance:
+
+The variable importance chart shows that lead_time, total_of_special_requests, and market_segmentOnline TA appear to be the top 3 most important factors in predicting cancellations.
+
+```{r,echo=FALSE}
+#view variable importance plot
+impPlot <- xgb.importance (feature_names = colnames(matrix.train),model = xgbmodel)
+xgb.plot.importance (importance_matrix = impPlot[1:20],xlab="Relative Importance") 
+
+```
+
+## Conclusions & Limitations
+
+### Conclusions:
+
+The random forest model had the highest accuracy because it correctly identified both true positives and true negatives out of all of the observations 83.8% of the time. The classification tree had the highest specificity, meaning that it correctly ruled out the negative class, noncancelled bookings, 91.9% of the time. Finally, the gradient boosting model had the highest sensitivity, meaning that it correctly identified the class of interest, canceled bookings, 75.2% of the time. 
+
+The best model is the XGBoost model because we are most interested in high sensitivity while also maintaining accuracy and specificity at good levels which it was able to do.  Also, when comparing the training and validation sets, we did not see overfitting/underfitting or any other issues. The gradient boosting model was not chosen because even though it had the highest sensitivity, its accuracy is a little lower. 
+
+The most important variables in predicting cancellations as shown by all the models are ADR, lead time, market segment, total of special requests and the non-refundable deposit type. 
+
+### Limitations:
+
+A limitation of this report is that the conclusions cannot be generalized to other hotels in Portugal or elsewhere. The results from the models and of course the exploratory data analysis only applies to the two hotels in the dataset. In order to be able to determine which variables are more influential in predicting cancellations, for example, data from more hotels need to be examined.  
+
+## References
+
+### References:
+
+Antonio, N., de Almeida, A., & Nunes, L. (2019a). Big Data in Hotel Revenue Management: Exploring Cancellation Drivers to Gain Insights Into Booking Cancellation Behavior. *Cornell Hospitality Quarterly, 60*(4), 298–319. 
+https://doi.org/10.1177/1938965519851466
+
+Antonio, N., de Almeida, A., & Nunes, L. (2019b). Hotel booking demand datasets. *Data in Brief, 22,* 41-49. https://doi.org/10.1016/j.dib.2018.11.126
+
+Burns, Kathleen. (2020). *Guide to Corporate Hotel Discounts.* lola.com. 
+https://www.lola.com/blog/guide-to-corporate-hotel-discounts
+
+Falk, M., & Vieru, M. (2018). Modelling the cancellation behaviour of hotel guests. *International Journal of Contemporary Hospitality Management.* https://doi.org/10.1108/IJCHM-08-2017-0509
+
+Hotelbeds. (2020, January 24). *Hotel market segmentation: how to target your most profitable guests.* hotelbeds. https://hotelier.hotelbeds.com/resources/insight/hotel-market-segmentation-how-target-your-most-profitable-guests
+
+Iyer, Karan. (2020, January 24). *Market Segmentation for Effective Revenue Management in Hotels.* MARTECHSERIES. https://martechseries.com/mts-insights/guest-authors/market-segmentation-effective-revenue-management-hotels/
+
+Landman, Patrick. (2020a, April 8). *Complimentary.* Xotels. 
+https://www.xotels.com/en/glossary/complimentary
+
+Landman, Patrick. (2020b, April 14). *Transient.* Xotels.      
+https://www.xotels.com/en/glossary/transient/
+
+Morales, D. R., & Wang, J. (2010). Forecasting cancellation rates for services booking revenue management using data mining. *European Journal of Operational Research, 202*(2), 554–562. https://doi.org/10.1016/j.ejor.2009.06.006
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
